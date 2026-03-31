@@ -1,0 +1,43 @@
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    platform: lending-collateral-infra
+    env:      docker-compose
+
+scrape_configs:
+
+  - job_name: api-gateway
+    static_configs:
+      - targets: ['api-gateway:8000']
+    metrics_path: /metrics
+
+  - job_name: lending-engine
+    static_configs:
+      - targets: ['lending-engine:8001']
+    metrics_path: /metrics
+
+  - job_name: collateral-manager
+    static_configs:
+      - targets: ['collateral-manager:8002']
+    metrics_path: /metrics
+
+  - job_name: margin-engine
+    static_configs:
+      - targets: ['margin-engine:8003']
+    metrics_path: /metrics
+
+  - job_name: liquidation-engine
+    static_configs:
+      - targets: ['liquidation-engine:8004']
+    metrics_path: /metrics
+
+  - job_name: price-oracle
+    static_configs:
+      - targets: ['price-oracle:8005']
+    metrics_path: /metrics
+
+  - job_name: compliance-monitor
+    static_configs:
+      - targets: ['compliance-monitor:8006']
+    metrics_path: /metrics

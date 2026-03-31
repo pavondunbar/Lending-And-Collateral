@@ -1,0 +1,412 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trust Boundary Model:
+#   DMZ network  → only api-gateway is reachable from outside
+#   internal net → postgres, kafka, and all microservices
+#   signing net  → MPC nodes and services that need transaction signing
+#   Each service container can only reach what it needs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  dmz:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true          # no outbound internet access from internal net
+  signing:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  kafka_data:
+  zookeeper_data:
+
+services:
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lending}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-s3cr3t}
+      POSTGRES_DB: ${POSTGRES_DB:-lending_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lending}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka_data:/var/lib/kafka
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./init/kafka:/scripts:ro
+    networks:
+      - internal
+    entrypoint: ["/bin/bash", "/scripts/create_topics.sh"]
+    restart: "no"
+
+  # ── Microservices ─────────────────────────────────────────────────────────
+
+  lending-engine:
+    build:
+      context: .
+      dockerfile: services/lending-engine/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: lending-engine
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-lending}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-lending_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      PORT: 8001
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  collateral-manager:
+    build:
+      context: .
+      dockerfile: services/collateral-manager/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: collateral-manager
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-lending}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-lending_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      SIGNING_GATEWAY_URL: http://signing-gateway:8007
+      PORT: 8002
+    networks:
+      - internal
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  margin-engine:
+    build:
+      context: .
+      dockerfile: services/margin-engine/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: margin-engine
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-lending}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-lending_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      PORT: 8003
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  liquidation-engine:
+    build:
+      context: .
+      dockerfile: services/liquidation-engine/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: liquidation-engine
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-lending}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-lending_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      SIGNING_GATEWAY_URL: http://signing-gateway:8007
+      PORT: 8004
+    networks:
+      - internal
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  price-oracle:
+    build:
+      context: .
+      dockerfile: services/price-oracle/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: price-oracle
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-lending}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-lending_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      PORT: 8005
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  compliance-monitor:
+    build:
+      context: .
+      dockerfile: services/compliance-monitor/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: compliance-monitor
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-lending}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-lending_db}
+      KAFKA_BOOTSTRAP: kafka:9092
+      PORT: 8006
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Outbox Publisher ──────────────────────────────────────────────────────
+
+  outbox-publisher:
+    build:
+      context: .
+      dockerfile: services/outbox-publisher/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://lending:s3cr3t@postgres:5432/lending_db
+      KAFKA_BOOTSTRAP: kafka:9092
+      POLL_INTERVAL_MS: 100
+      SERVICE_NAME: outbox-publisher
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Signing Infrastructure ────────────────────────────────────────────────
+
+  signing-gateway:
+    build:
+      context: .
+      dockerfile: services/signing-gateway/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mpc-node-1:
+        condition: service_healthy
+      mpc-node-2:
+        condition: service_healthy
+      mpc-node-3:
+        condition: service_healthy
+    environment:
+      MPC_NODES: http://mpc-node-1:8001,http://mpc-node-2:8001,http://mpc-node-3:8001
+      SERVICE_NAME: signing-gateway
+      PORT: 8007
+    networks:
+      - internal
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  mpc-node-1:
+    build:
+      context: .
+      dockerfile: services/mpc-node/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ID: node-1
+      SERVICE_NAME: mpc-node-1
+      PORT: 8001
+    networks:
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  mpc-node-2:
+    build:
+      context: .
+      dockerfile: services/mpc-node/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ID: node-2
+      SERVICE_NAME: mpc-node-2
+      PORT: 8001
+    networks:
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  mpc-node-3:
+    build:
+      context: .
+      dockerfile: services/mpc-node/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ID: node-3
+      SERVICE_NAME: mpc-node-3
+      PORT: 8001
+    networks:
+      - signing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Observability Stack ───────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    networks:
+      - internal
+      - dmz
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - ./monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - ./monitoring/grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/provider.yml:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - dmz
+
+  # ── API Gateway — only internet-facing service ───────────────────────────
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      lending-engine:
+        condition: service_healthy
+      collateral-manager:
+        condition: service_healthy
+      margin-engine:
+        condition: service_healthy
+      liquidation-engine:
+        condition: service_healthy
+      price-oracle:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: api-gateway
+      LENDING_ENGINE_URL: http://lending-engine:8001
+      COLLATERAL_MANAGER_URL: http://collateral-manager:8002
+      MARGIN_ENGINE_URL: http://margin-engine:8003
+      LIQUIDATION_ENGINE_URL: http://liquidation-engine:8004
+      PRICE_ORACLE_URL: http://price-oracle:8005
+      SIGNING_GATEWAY_URL: http://signing-gateway:8007
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-change-me-in-production}
+      PORT: 8000
+    ports:
+      - "8000:8000"        # Only exposed port — DMZ boundary
+    networks:
+      - dmz
+      - internal
