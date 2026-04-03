@@ -12,8 +12,11 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import uuid
 from decimal import Decimal
+
+sys.path.insert(0, "/app/shared")
 
 from aiohttp import ClientSession, ClientTimeout, web
 

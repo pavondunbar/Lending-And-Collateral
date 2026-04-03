@@ -275,6 +275,8 @@ services:
       dockerfile: services/signing-gateway/Dockerfile
     restart: unless-stopped
     depends_on:
+      postgres:
+        condition: service_healthy
       mpc-node-1:
         condition: service_healthy
       mpc-node-2:
@@ -284,6 +286,7 @@ services:
     environment:
       MPC_NODES: http://mpc-node-1:8001,http://mpc-node-2:8001,http://mpc-node-3:8001
       SERVICE_NAME: signing-gateway
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-lending}:${POSTGRES_PASSWORD:-s3cr3t}@postgres:5432/${POSTGRES_DB:-lending_db}
       PORT: 8007
     networks:
       - internal

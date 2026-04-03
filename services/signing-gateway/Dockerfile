@@ -9,6 +9,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl && \
     rm -rf /var/lib/apt/lists/*
 
+# Copy shared library first (cache layer)
+COPY shared/ /app/shared/
+
 # Copy service-specific requirements and install
 COPY services/signing-gateway/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
