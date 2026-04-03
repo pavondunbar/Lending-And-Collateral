@@ -23,9 +23,11 @@ from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
+from starlette.requests import Request
 
 # ── path setup so we can import the shared package ──────────────────
 import sys
@@ -45,6 +47,10 @@ from shared.journal import (
 from shared.outbox import insert_outbox_event
 from shared.status import record_status
 from shared.models import LoanStatusHistory
+from shared.idempotency import (
+    get_idempotency_key, check_idempotency,
+    store_idempotency_result,
+)
 from events import (
     LoanOriginated, LoanDisbursed,
     LoanRepaymentReceived, LoanRepaymentCompleted,
@@ -698,6 +704,16 @@ app = FastAPI(
 instrument_app(app, SERVICE)
 
 
+@app.middleware("http")
+async def extract_context(request, call_next):
+    from shared.request_context import set_context
+    trace_id = request.headers.get("X-Trace-ID", "")
+    actor_id = request.headers.get("X-Actor-Id", "")
+    set_context(trace_id=trace_id, actor_id=actor_id)
+    response = await call_next(request)
+    return response
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": SERVICE}
@@ -753,6 +769,7 @@ def get_account(
     status_code=status.HTTP_201_CREATED,
 )
 def originate_loan(
+    request: Request,
     req: OriginateLoanRequest,
     db: Session = Depends(get_db_session),
 ):
@@ -761,9 +778,17 @@ def originate_loan(
     Verifies borrower KYC/AML, collateral coverage, and lender pool
     balance before disbursing funds via double-entry journal entries.
     """
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     loan = _originate_loan(db, req)
     current_ltv = _compute_current_ltv(db, loan)
-    return LoanResponse(
+    result = LoanResponse(
         loan_id=str(loan.id),
         loan_ref=loan.loan_ref,
         borrower_id=str(loan.borrower_id),
@@ -776,10 +801,16 @@ def originate_loan(
         disbursed_at=loan.disbursed_at,
         created_at=loan.created_at,
     )
+    if idem_key:
+        store_idempotency_result(
+            db, idem_key, 201, result.model_dump(mode="json"),
+        )
+    return result
 
 
 @app.post("/loans/{loan_ref}/repay")
 def repay_loan(
+    request: Request,
     loan_ref: str,
     req: RepaymentRequest,
     db: Session = Depends(get_db_session),
@@ -789,6 +820,14 @@ def repay_loan(
     Interest is paid first, then principal. If fully repaid,
     the loan status transitions to 'repaid'.
     """
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     loan = db.execute(
         select(Loan).where(Loan.loan_ref == loan_ref)
     ).scalar_one_or_none()
@@ -796,16 +835,28 @@ def repay_loan(
         raise HTTPException(
             status_code=404, detail="Loan not found",
         )
-    return _repay_loan(db, loan, req.amount, req.currency)
+    result = _repay_loan(db, loan, req.amount, req.currency)
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.post("/loans/{loan_ref}/accrue-interest")
 def accrue_interest(
+    request: Request,
     loan_ref: str,
     req: AccrueInterestRequest,
     db: Session = Depends(get_db_session),
 ):
     """Trigger interest accrual for a single loan."""
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     loan = db.execute(
         select(Loan).where(Loan.loan_ref == loan_ref)
     ).scalar_one_or_none()
@@ -819,20 +870,32 @@ def accrue_interest(
         accrual_dt = date.fromisoformat(req.accrual_date)
 
     event = _accrue_interest(db, loan, accrual_dt)
-    return {
+    result = {
         "loan_ref": loan_ref,
         "accrual_date": str(event.accrual_date),
         "accrued_amount": str(event.accrued_amount),
         "cumulative_interest": str(event.cumulative_interest),
     }
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.post("/loans/accrue-all")
 def accrue_all(
+    request: Request,
     req: AccrueInterestRequest,
     db: Session = Depends(get_db_session),
 ):
     """Batch daily interest accrual for all active loans."""
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     accrual_dt = date.today()
     if req.accrual_date:
         accrual_dt = date.fromisoformat(req.accrual_date)
@@ -856,15 +919,27 @@ def accrue_all(
         "Batch accrual completed: %d loans, date=%s",
         len(results), accrual_dt,
     )
-    return {"accrual_date": str(accrual_dt), "loans": results}
+    result = {"accrual_date": str(accrual_dt), "loans": results}
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.post("/loans/{loan_ref}/close")
 def close_loan(
+    request: Request,
     loan_ref: str,
     db: Session = Depends(get_db_session),
 ):
     """Close a fully repaid loan."""
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     loan = db.execute(
         select(Loan).where(Loan.loan_ref == loan_ref)
     ).scalar_one_or_none()
@@ -873,13 +948,16 @@ def close_loan(
             status_code=404, detail="Loan not found",
         )
     loan = _close_loan(db, loan)
-    return {
+    result = {
         "loan_ref": loan.loan_ref,
         "status": loan.status,
         "closed_at": (
             loan.closed_at.isoformat() if loan.closed_at else None
         ),
     }
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.get("/loans/{loan_ref}", response_model=LoanResponse)

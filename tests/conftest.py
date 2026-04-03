@@ -14,13 +14,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event as sa_event
+from sqlalchemy import create_engine, event as sa_event, JSON
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+# Map Postgres-specific types to SQLite equivalents
+compiles(JSONB, "sqlite")(lambda element, compiler, **kw: "JSON")
+compiles(UUID, "sqlite")(
+    lambda element, compiler, **kw: "VARCHAR(36)"
+)
+
 # ── path setup ────────────────────────────────────────────────────────────────
-sys.path.insert(0, "/Users/pavondunbar/Lending-And-Collateral")
-sys.path.insert(0, "/Users/pavondunbar/Lending-And-Collateral/shared")
+sys.path.insert(0, "/Users/pavondunbar/STABLECOIN-PYTHON/LENDING-PYTHON")
+sys.path.insert(0, "/Users/pavondunbar/STABLECOIN-PYTHON/LENDING-PYTHON/shared")
 
 # Patch env before any service module is imported
 import os
@@ -59,8 +67,15 @@ from shared.models import (
     MarginCallStatusHistory,
     LiquidationStatusHistory,
     ComplianceEvent,
+    ApiKey,
+    IdempotencyKey,
+    ProcessedEvent,
+    DlqEvent,
+    Settlement,
+    SettlementStatusHistory,
 )
 from shared.journal import record_journal_pair
+from shared.rbac import hash_key
 
 
 # ─── Database ────────────────────────────────────────────────────────────────
@@ -483,3 +498,59 @@ def btc_price(db) -> PriceFeed:
 def eth_price(db) -> PriceFeed:
     """PriceFeed for ETH at $3,200."""
     return make_price_feed(db, "ETH", Decimal("3200"))
+
+
+# ─── New Feature Factory Functions ──────────────────────────────────────────
+
+def make_api_key(
+    db: Session,
+    raw_key: str,
+    role: str = "admin",
+    label: str = "test-key",
+    is_active: bool = True,
+) -> ApiKey:
+    """Create an ApiKey row with the hashed key."""
+    api_key = ApiKey(
+        key_hash=hash_key(raw_key),
+        role=role,
+        label=label,
+        is_active=is_active,
+    )
+    db.add(api_key)
+    db.flush()
+    return api_key
+
+
+def make_settlement(
+    db: Session,
+    related_entity_type: str = "loan",
+    related_entity_id=None,
+    operation: str = "disbursement",
+    asset_type: str = "BTC",
+    quantity: Decimal = Decimal("10"),
+    status: str = "pending",
+) -> Settlement:
+    """Create a Settlement row."""
+    settlement_ref = f"STL-{uuid.uuid4().hex[:16].upper()}"
+    entity_id = (
+        related_entity_id
+        if related_entity_id
+        else uuid.uuid4()
+    )
+    entity_uuid = (
+        uuid.UUID(str(entity_id))
+        if not isinstance(entity_id, uuid.UUID)
+        else entity_id
+    )
+    settlement = Settlement(
+        settlement_ref=settlement_ref,
+        related_entity_type=related_entity_type,
+        related_entity_id=entity_uuid,
+        operation=operation,
+        asset_type=asset_type,
+        quantity=quantity,
+        status=status,
+    )
+    db.add(settlement)
+    db.flush()
+    return settlement

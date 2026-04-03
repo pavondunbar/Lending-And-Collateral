@@ -27,9 +27,11 @@ from typing import Optional
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
+from starlette.requests import Request
 
 # ── path setup so we can import the shared package ──────────────────
 import sys
@@ -47,6 +49,10 @@ from shared.status import record_status
 from shared.models import (
     LoanStatusHistory, LiquidationStatusHistory,
     CollateralStatusHistory,
+)
+from shared.idempotency import (
+    get_idempotency_key, check_idempotency,
+    store_idempotency_result,
 )
 from events import (
     LiquidationInitiated, LiquidationExecuted,
@@ -450,6 +456,19 @@ def _execute_collateral_sale(
         ),
     )
 
+    from shared.settlement import create_settlement
+    from shared.request_context import get_actor_id, get_trace_id
+    settlement = create_settlement(
+        db,
+        related_entity_type="liquidation",
+        related_entity_id=liq_event.id,
+        operation="collateral_sale",
+        asset_type=asset_type,
+        quantity=quantity,
+        actor_id=get_actor_id(),
+        trace_id=get_trace_id(),
+    )
+
     log.info(
         "Collateral sold: %s %s %s @ %s = %s",
         liquidation_ref, quantity, asset_type,
@@ -465,6 +484,7 @@ def _execute_collateral_sale(
         "total_proceeds": str(liq_event.total_proceeds),
         "tx_hash": tx_hash,
         "status": liq_event.status,
+        "settlement_ref": settlement.settlement_ref,
     }
 
 
@@ -680,6 +700,16 @@ app = FastAPI(
 instrument_app(app, SERVICE)
 
 
+@app.middleware("http")
+async def extract_context(request, call_next):
+    from shared.request_context import set_context
+    trace_id = request.headers.get("X-Trace-ID", "")
+    actor_id = request.headers.get("X-Actor-Id", "")
+    set_context(trace_id=trace_id, actor_id=actor_id)
+    response = await call_next(request)
+    return response
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": SERVICE}
@@ -690,6 +720,7 @@ def health():
     status_code=status.HTTP_201_CREATED,
 )
 def initiate_liquidation(
+    request: Request,
     req: InitiateLiquidationRequest,
     db: Session = Depends(get_db_session),
 ):
@@ -698,18 +729,30 @@ def initiate_liquidation(
     Creates a LiquidationEvent, records status history, and
     emits a liquidation.initiated event via the outbox.
     """
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     liq_event = _initiate_liquidation(db, req.loan_ref)
     loan = db.get(Loan, liq_event.loan_id)
-    return {
+    result = {
         "liquidation_ref": liq_event.liquidation_ref,
         "loan_ref": loan.loan_ref if loan else req.loan_ref,
         "trigger_ltv": str(liq_event.trigger_ltv),
         "status": liq_event.status,
     }
+    if idem_key:
+        store_idempotency_result(db, idem_key, 201, result)
+    return result
 
 
 @app.post("/liquidations/{ref}/execute")
 def execute_sale(
+    request: Request,
     ref: str,
     req: ExecuteSaleRequest,
     db: Session = Depends(get_db_session),
@@ -720,13 +763,25 @@ def execute_sale(
     price, signs the release transaction, and records journal
     entries for the proceeds.
     """
-    return _execute_collateral_sale(
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
+    result = _execute_collateral_sale(
         db, ref, req.asset_type, req.quantity, req.sale_price,
     )
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.post("/liquidations/{ref}/waterfall")
 def apply_waterfall(
+    request: Request,
     ref: str,
     req: WaterfallRequest,
     db: Session = Depends(get_db_session),
@@ -737,7 +792,18 @@ def apply_waterfall(
     loan principal, fees, then remainder to borrower. Sets
     final loan and liquidation status.
     """
-    return _apply_waterfall(db, ref, req.fee_amount)
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
+    result = _apply_waterfall(db, ref, req.fee_amount)
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.get("/liquidations")

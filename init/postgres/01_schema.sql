@@ -551,6 +551,147 @@ JOIN collateral_positions cp ON cp.loan_id = l.id
 LEFT JOIN latest_prices lp   ON lp.asset_type = cp.asset_type;
 
 -- =====================================================================================
+-- Audit Trail: actor_id and trace_id on status history tables
+-- =====================================================================================
+
+ALTER TABLE loan_status_history ADD COLUMN actor_id VARCHAR(255);
+ALTER TABLE loan_status_history ADD COLUMN trace_id UUID;
+ALTER TABLE collateral_status_history ADD COLUMN actor_id VARCHAR(255);
+ALTER TABLE collateral_status_history ADD COLUMN trace_id UUID;
+ALTER TABLE margin_call_status_history ADD COLUMN actor_id VARCHAR(255);
+ALTER TABLE margin_call_status_history ADD COLUMN trace_id UUID;
+ALTER TABLE liquidation_status_history ADD COLUMN actor_id VARCHAR(255);
+ALTER TABLE liquidation_status_history ADD COLUMN trace_id UUID;
+
+-- =====================================================================================
+-- RBAC
+-- =====================================================================================
+
+CREATE TYPE api_role AS ENUM ('admin', 'operator', 'signer', 'viewer', 'system');
+
+CREATE TABLE api_keys (
+    id                      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    key_hash                VARCHAR(255) UNIQUE NOT NULL,
+    role                    api_role NOT NULL,
+    label                   VARCHAR(255) NOT NULL,
+    is_active               BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_api_keys_hash ON api_keys(key_hash) WHERE is_active = TRUE;
+
+-- =====================================================================================
+-- Idempotency
+-- =====================================================================================
+
+CREATE TABLE idempotency_keys (
+    key                     VARCHAR(255) PRIMARY KEY,
+    response_status         INTEGER NOT NULL,
+    response_body           JSONB NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at              TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours')
+);
+
+CREATE TRIGGER trg_idempotency_keys_immutable
+    BEFORE UPDATE OR DELETE ON idempotency_keys
+    FOR EACH ROW EXECUTE FUNCTION reject_modification();
+
+CREATE TABLE processed_events (
+    event_id                VARCHAR(255) PRIMARY KEY,
+    topic                   VARCHAR(255) NOT NULL,
+    processed_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TRIGGER trg_processed_events_immutable
+    BEFORE UPDATE OR DELETE ON processed_events
+    FOR EACH ROW EXECUTE FUNCTION reject_modification();
+
+-- =====================================================================================
+-- Dead Letter Queue
+-- =====================================================================================
+
+CREATE TABLE dlq_events (
+    id                      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    original_topic          VARCHAR(255) NOT NULL,
+    event_id                VARCHAR(255) NOT NULL,
+    payload                 JSONB NOT NULL,
+    error_message           TEXT NOT NULL,
+    retry_count             INTEGER NOT NULL DEFAULT 0,
+    first_failed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_failed_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_dlq_events_topic ON dlq_events(original_topic);
+CREATE INDEX idx_dlq_events_event_id ON dlq_events(event_id);
+
+CREATE TRIGGER trg_dlq_events_immutable
+    BEFORE UPDATE OR DELETE ON dlq_events
+    FOR EACH ROW EXECUTE FUNCTION reject_modification();
+
+-- =====================================================================================
+-- Settlement State Machine
+-- =====================================================================================
+
+CREATE TYPE settlement_status AS ENUM (
+    'pending', 'approved', 'signed', 'broadcasted', 'confirmed', 'failed'
+);
+
+CREATE TABLE settlements (
+    id                      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    settlement_ref          VARCHAR(64) UNIQUE NOT NULL,
+    related_entity_type     VARCHAR(50) NOT NULL,
+    related_entity_id       UUID NOT NULL,
+    operation               VARCHAR(50) NOT NULL,
+    asset_type              VARCHAR(10) NOT NULL,
+    quantity                NUMERIC(28, 8) NOT NULL,
+    tx_hash                 VARCHAR(255),
+    block_number            BIGINT,
+    confirmations           INTEGER NOT NULL DEFAULT 0,
+    required_confirmations  INTEGER NOT NULL DEFAULT 6,
+    status                  settlement_status NOT NULL DEFAULT 'pending',
+    approved_by             VARCHAR(255),
+    signed_at               TIMESTAMPTZ,
+    broadcasted_at          TIMESTAMPTZ,
+    confirmed_at            TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_settlements_ref ON settlements(settlement_ref);
+CREATE INDEX idx_settlements_entity ON settlements(related_entity_type, related_entity_id);
+CREATE INDEX idx_settlements_status ON settlements(status);
+
+CREATE TABLE settlement_status_history (
+    id                      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    settlement_id           UUID NOT NULL REFERENCES settlements(id),
+    status                  VARCHAR(20) NOT NULL,
+    detail                  JSONB,
+    actor_id                VARCHAR(255),
+    trace_id                UUID,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_settlement_status_history ON settlement_status_history(settlement_id);
+
+CREATE TRIGGER trg_settlement_status_history_immutable
+    BEFORE UPDATE OR DELETE ON settlement_status_history
+    FOR EACH ROW EXECUTE FUNCTION reject_modification();
+
+CREATE OR REPLACE FUNCTION sync_settlement_status()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE settlements
+       SET status = NEW.status::settlement_status
+     WHERE id = NEW.settlement_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_sync_settlement_status
+    AFTER INSERT ON settlement_status_history
+    FOR EACH ROW EXECUTE FUNCTION sync_settlement_status();
+
+-- =====================================================================================
 -- Seed: System Accounts
 -- =====================================================================================
 
@@ -559,3 +700,13 @@ VALUES
     ('00000000-0000-0000-0000-000000000001', 'SYSTEM_LENDING_POOL', 'lending_pool', TRUE, TRUE, 1),
     ('00000000-0000-0000-0000-000000000002', 'SYSTEM_CUSTODY',      'custodian',    TRUE, TRUE, 1),
     ('00000000-0000-0000-0000-000000000003', 'SYSTEM_INSURANCE',    'system',       TRUE, TRUE, 1);
+
+-- Seed: Default admin API key (SHA-256 of 'change-me-in-production')
+INSERT INTO api_keys (id, key_hash, role, label, is_active)
+VALUES (
+    '00000000-0000-0000-0000-000000000010',
+    encode(digest('change-me-in-production', 'sha256'), 'hex'),
+    'admin',
+    'Default Admin Key',
+    TRUE
+);

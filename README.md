@@ -32,9 +32,9 @@ The system is modeled closely on how institutional digital asset lending infrast
 |-----------|-------|----------------|
 | Microservices | 10 | Lending, collateral, margin, liquidation, pricing, compliance, signing, gateway, outbox |
 | MPC Nodes | 3 | Threshold cryptography for collateral release signing |
-| Kafka Topics | 21 | Event-driven lifecycle tracking across all services |
-| Database Tables | 15+ | Append-only immutable ledger with double-entry accounting |
-| API Endpoints | 25+ | Full REST API behind authenticated gateway |
+| Kafka Topics | 52 | 26 primary event topics + 26 Dead Letter Queue topics |
+| Database Tables | 20+ | Append-only immutable ledger with double-entry accounting |
+| API Endpoints | 25+ | Full REST API behind RBAC-authenticated gateway |
 | Docker Networks | 3 | Trust boundary isolation (DMZ, internal, signing) |
 
 ---
@@ -81,9 +81,9 @@ This system implements the full institutional workflow: origination, custody, mo
   ─────────────────────────────────────────────────────────────────────────────────
 
   Clients ──► API Gateway (8000)
-              │  X-API-Key auth
+              │  RBAC (5 roles via X-API-Key)
               │  Rate limiter (1000/60s)
-              │  Audit trail → Kafka
+              │  Audit trail → Kafka (trace_id + actor_id)
               │
               ├──► Lending Engine (8001)      PostgreSQL 16
               │    Loan origination            │  Append-only ledger
@@ -115,9 +115,9 @@ This system implements the full institutional workflow: origination, custody, mo
                    Kafka event consumption     │
                                                │
               Outbox Publisher (8010) ──────────┤──► Apache Kafka
-              Polls outbox table                     21 topics
+              Polls outbox table                     26 primary + 26 DLQ topics
               Advisory locking (SKIP LOCKED)         7-30 day retention
-              At-least-once delivery
+              At-least-once delivery + DLQ
                                                │
               Prometheus (9090) ◄───────────────┤    Metrics scraping
               Grafana (3000)                         Dashboard visualization
@@ -218,13 +218,15 @@ Three independent signing nodes that each produce a partial signature using thei
 
 ### `API Gateway` — Authentication & Routing
 
-The sole internet-facing service. Authenticates all requests via `X-API-Key`, enforces sliding-window rate limiting, proxies requests to internal services, and writes an audit trail to Kafka for every API call.
+The sole internet-facing service. Authenticates all requests via `X-API-Key` with role-based access control, enforces sliding-window rate limiting, propagates trace context to internal services, and writes an audit trail to Kafka for every API call.
 
 **Security features:**
-- Mandatory `X-API-Key` authentication on all `/v1/*` routes
+- Role-Based Access Control (RBAC) with 5 roles: `admin`, `operator`, `signer`, `viewer`, `system`
+- SHA-256 hashed API key lookup with per-role permission matrix enforcement
 - Sliding-window rate limiter: 1,000 requests per 60 seconds per key
 - Reverse proxy with per-route upstream mapping
 - Audit trail event emission to `audit.trail` Kafka topic
+- Propagates `X-Request-ID`, `X-Trace-ID`, `X-Actor-Id`, and `X-Actor-Role` headers to upstream services
 - Aggregated health check across all upstream services
 
 ### `Outbox Publisher` — Reliable Event Delivery
@@ -245,9 +247,9 @@ Every financial operation — loan disbursement, interest accrual, collateral de
 
 Every service writes its outbox event in the **same database transaction** as the business record. This eliminates the dual-write problem across all services. The outbox publisher delivers events to Kafka only after they are safely committed to PostgreSQL — downstream systems (compliance, risk, audit) never miss an event, even across crashes.
 
-### :white_check_mark: Append-Only Audit Trails
+### :white_check_mark: Append-Only Audit Trails with Distributed Tracing
 
-Status history tables (`loan_status_history`, `collateral_status_history`, `margin_call_status_history`, `liquidation_status_history`) are immutable. Every state transition is recorded with a timestamp and optional JSONB detail payload. This enables complete lifecycle reconstruction for regulatory auditors.
+Status history tables (`loan_status_history`, `collateral_status_history`, `margin_call_status_history`, `liquidation_status_history`, `settlement_status_history`) are immutable. Every state transition is recorded with a timestamp, optional JSONB detail payload, `actor_id` (who performed the action), and `trace_id` (request correlation). Context is propagated automatically via Python `contextvars` — upstream services receive trace headers from the API gateway and inject them into all status history writes without explicit parameter passing.
 
 ### :white_check_mark: MPC Threshold Signing — No Single Point of Compromise
 
@@ -275,13 +277,44 @@ The price oracle ingests feeds from multiple sources (Coinbase, Binance, Kraken,
 
 Three isolated Docker networks enforce the principle of least privilege: the DMZ exposes only the API gateway, the internal network sandboxes all microservices and databases with no outbound internet access, and the signing network isolates MPC nodes from everything except the signing gateway.
 
-### :white_check_mark: Idempotent Operations & Advisory Locking
+### :white_check_mark: Idempotency Layer (APIs + Message Consumers)
 
-PostgreSQL advisory locks (`pg_advisory_xact_lock`) prevent double-spend race conditions on concurrent operations. The outbox publisher uses `FOR UPDATE SKIP LOCKED` for safe multi-replica deployment without message duplication.
+All POST endpoints are protected by an `Idempotency-Key` header mechanism. The gateway passes the header to upstream services, which check the `idempotency_keys` table (using `SELECT FOR UPDATE` on Postgres) before processing. Duplicate requests return the cached response. Kafka consumers deduplicate via the `processed_events` table, checking `event_id` before invoking handlers. Both tables are append-only with immutability triggers.
 
-### :white_check_mark: Event-Driven Architecture (21 Kafka Topics)
+### :white_check_mark: Role-Based Access Control (RBAC)
 
-All lifecycle events — loan origination, collateral deposits, margin calls, liquidations, price updates, compliance alerts — are published to dedicated Kafka topics with 7-30 day retention. Downstream services consume events asynchronously, enabling loose coupling and independent scaling.
+Five roles enforce separation of duties at the API gateway:
+
+| Role | Permissions |
+|------|-------------|
+| `admin` | Full access to all endpoints |
+| `operator` | POST on loans, collateral, margin, liquidations, prices; all GET |
+| `signer` | POST on signing endpoints; all GET |
+| `viewer` | Read-only GET access |
+| `system` | POST on prices and margin (automated services); all GET |
+
+API keys are SHA-256 hashed and stored in the `api_keys` table with role assignments. The gateway resolves the role from the key hash and checks the permission matrix before proxying requests.
+
+### :white_check_mark: Settlement State Machine
+
+On-chain settlement transactions follow a deterministic state machine:
+
+```
+  PENDING ──► APPROVED ──► SIGNED ──► BROADCASTED ──► CONFIRMED
+     ▲           │            │            │
+     └───────────┴────────────┴────────────┘
+                    FAILED (recoverable → PENDING)
+```
+
+Each transition is validated against `VALID_TRANSITIONS`, and invalid transitions raise an error. The `settlements` table tracks `tx_hash`, `block_number`, `confirmations`, and timestamps for each phase. All transitions are recorded in `settlement_status_history` with `actor_id` and `trace_id`.
+
+### :white_check_mark: Dead Letter Queue (DLQ)
+
+Failed Kafka messages are retried up to 3 times. After exhausting retries, the message is published to a `{topic}.dlq` topic and recorded in the `dlq_events` table with the original payload, error message, and retry count. Every primary topic has a corresponding DLQ topic (26 DLQ topics total) with 30-day retention.
+
+### :white_check_mark: Event-Driven Architecture (52 Kafka Topics)
+
+All lifecycle events — loan origination, collateral deposits, margin calls, liquidations, price updates, compliance alerts, settlement transitions — are published to dedicated Kafka topics with 7-30 day retention. Each primary topic has a corresponding DLQ topic for failed message handling. Downstream services consume events asynchronously, enabling loose coupling and independent scaling.
 
 ---
 
@@ -397,6 +430,67 @@ Reliable Kafka delivery buffer.
 | `payload` | JSONB | Serialized event data |
 | `published_at` | TIMESTAMP | NULL = pending Kafka delivery |
 
+### `api_keys`
+
+RBAC key registry with SHA-256 hashed keys.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key_hash` | VARCHAR(255) UNIQUE | SHA-256 hash of the raw API key |
+| `role` | ENUM | `admin`, `operator`, `signer`, `viewer`, `system` |
+| `label` | VARCHAR | Human-readable key description |
+| `is_active` | BOOLEAN | Whether the key is currently active |
+
+### `idempotency_keys`
+
+Request deduplication for POST endpoints — **immutable (no UPDATE or DELETE)**.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key` | VARCHAR(255) PK | Idempotency key from request header |
+| `response_status` | INTEGER | Cached HTTP status code |
+| `response_body` | JSONB | Cached response payload |
+| `expires_at` | TIMESTAMP | Auto-set to 24 hours after creation |
+
+### `processed_events`
+
+Kafka consumer deduplication — **immutable (no UPDATE or DELETE)**.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `event_id` | VARCHAR(255) PK | Unique event identifier |
+| `topic` | VARCHAR | Source Kafka topic |
+| `processed_at` | TIMESTAMP | When the event was processed |
+
+### `dlq_events`
+
+Dead Letter Queue tracking — **immutable (no UPDATE or DELETE)**.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `original_topic` | VARCHAR | Source Kafka topic that failed |
+| `event_id` | VARCHAR | Failed event identifier |
+| `payload` | JSONB | Original event payload |
+| `error_message` | TEXT | Last error encountered |
+| `retry_count` | INTEGER | Number of attempts before DLQ |
+
+### `settlements`
+
+On-chain settlement lifecycle tracking.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `settlement_ref` | VARCHAR(64) UNIQUE | Settlement reference (e.g., `STL-A1B2C3D4E5F6`) |
+| `related_entity_type` | VARCHAR | Entity type (`collateral`, `liquidation`) |
+| `related_entity_id` | UUID | Associated entity ID |
+| `operation` | VARCHAR | Operation type (`withdrawal`, `liquidation`) |
+| `asset_type` | VARCHAR | Crypto asset (BTC, ETH, SOL, AVAX) |
+| `quantity` | NUMERIC(28,8) | Amount of asset |
+| `tx_hash` | VARCHAR | Simulated transaction hash |
+| `block_number` | BIGINT | Simulated block number |
+| `confirmations` | INTEGER | Block confirmations received |
+| `status` | ENUM | `pending` → `approved` → `signed` → `broadcasted` → `confirmed` / `failed` |
+
 ---
 
 ## :arrows_counterclockwise: State Machines
@@ -464,6 +558,24 @@ Reliable Kafka delivery buffer.
                                     │
                                     └──► PARTIAL    (insufficient proceeds)
 ```
+
+### Settlement Status (On-Chain Transaction Lifecycle)
+
+```
+  create_settlement() ──► PENDING
+                             │
+                             ├──► APPROVED    (admin authorization)
+                             │       │
+                             │       └──► SIGNED        (MPC 2-of-3 threshold signature)
+                             │               │
+                             │               └──► BROADCASTED  (submitted to blockchain)
+                             │                       │
+                             │                       └──► CONFIRMED  (block confirmations met)
+                             │
+                             └──► FAILED      (any stage — recoverable back to PENDING)
+```
+
+Transitions are validated against a deterministic `VALID_TRANSITIONS` map. Invalid transitions raise `ValueError`. Each transition records an immutable `settlement_status_history` row with `actor_id`, `trace_id`, and timestamps.
 
 ---
 
@@ -672,7 +784,7 @@ Lending-And-Collateral/
 ├── services/                         # Microservices (one directory per service)
 │   ├── api-gateway/                  # Internet-facing reverse proxy
 │   │   ├── Dockerfile
-│   │   ├── main.py                   # X-API-Key auth, rate limiting, audit trail
+│   │   ├── main.py                   # RBAC, rate limiting, trace context propagation
 │   │   └── requirements.txt
 │   │
 │   ├── lending-engine/               # Loan origination, repayment, interest
@@ -721,20 +833,24 @@ Lending-And-Collateral/
 │       └── requirements.txt
 │
 ├── shared/                           # Common packages used by all services
-│   ├── models.py                     # SQLAlchemy ORM — complete domain model (~530 lines)
+│   ├── models.py                     # SQLAlchemy ORM — complete domain model
 │   ├── database.py                   # Session factory, connection pooling
 │   ├── journal.py                    # Double-entry ledger operations
 │   ├── events.py                     # Pydantic event schemas for Kafka
-│   ├── kafka_client.py               # Confluent Kafka producer wrapper
+│   ├── kafka_client.py               # Confluent Kafka producer/consumer with DLQ
 │   ├── outbox.py                     # Transactional outbox helpers
 │   ├── metrics.py                    # Prometheus instrumentation
-│   └── status.py                     # Append-only status history tracking
+│   ├── status.py                     # Append-only status history with trace context
+│   ├── idempotency.py                # Idempotency-Key dedup for POST endpoints
+│   ├── rbac.py                       # Role-based access control permission matrix
+│   ├── request_context.py            # Per-request trace_id/actor_id via contextvars
+│   └── settlement.py                 # Settlement state machine (PENDING → CONFIRMED)
 │
 ├── init/                             # Bootstrap scripts (auto-run on first start)
 │   ├── postgres/
-│   │   └── 01_schema.sql             # Full PostgreSQL schema (~500 lines)
+│   │   └── 01_schema.sql             # Full PostgreSQL schema (~710 lines)
 │   └── kafka/
-│       └── create_topics.sh          # 21 topics with partition & retention config
+│       └── create_topics.sh          # 52 topics (26 primary + 26 DLQ) with partition & retention config
 │
 ├── scripts/                          # Operational utilities
 │   ├── demo.py                       # Live-stack demonstration (~700 lines)
@@ -750,7 +866,12 @@ Lending-And-Collateral/
 │   ├── test_price_oracle.py          # Price feed ingestion, aggregation
 │   ├── test_journal.py              # Double-entry balance validation
 │   ├── test_outbox.py                # Transactional outbox reliability
-│   └── test_e2e_scenarios.py         # Full loan lifecycle scenarios
+│   ├── test_e2e_scenarios.py         # Full loan lifecycle scenarios
+│   ├── test_rbac.py                  # Role permission matrix validation
+│   ├── test_idempotency.py           # Request dedup and cached response replay
+│   ├── test_dlq.py                   # Dead Letter Queue routing and dedup
+│   ├── test_settlement.py            # Settlement state machine transitions
+│   └── test_audit_context.py         # Audit context propagation via contextvars
 │
 ├── migrations/                       # Alembic database migrations
 │   └── versions/
@@ -773,7 +894,7 @@ Lending-And-Collateral/
 | Licensed custodian integration (Fireblocks, Copper.co) | Cannot verify actual asset custody positions |
 | Real price oracle integration (Chainlink, Pyth) | Price manipulation enables collateral theft via bad valuations |
 | HSM key management (Thales, AWS CloudHSM) | Signing keys stored in software, not tamper-proof hardware |
-| Authentication & authorization (OAuth2 / mTLS) | Any caller can originate loans and liquidate collateral |
+| Production-grade auth (OAuth2 / mTLS / JWT) | RBAC with API keys is implemented but not sufficient for production — requires OAuth2, mTLS, or JWT with proper token lifecycle |
 | Real AML/KYC provider integration (Chainalysis, Elliptic) | No actual sanctions or transaction screening |
 | Banking license / money transmitter license | Lending without appropriate licenses is illegal |
 | On-chain settlement integration | Cannot actually move crypto assets on any blockchain |

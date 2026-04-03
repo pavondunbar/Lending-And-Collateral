@@ -24,9 +24,11 @@ from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
+from starlette.requests import Request
 
 # ── path setup so we can import the shared package ──────────────────
 import sys
@@ -42,6 +44,10 @@ from shared.journal import record_journal_pair, acquire_balance_lock
 from shared.outbox import insert_outbox_event
 from shared.status import record_status
 from shared.models import CollateralStatusHistory, LoanStatusHistory
+from shared.idempotency import (
+    get_idempotency_key, check_idempotency,
+    store_idempotency_result,
+)
 from events import (
     CollateralDeposited, CollateralWithdrawn,
     CollateralSubstituted, CollateralValuationComputed,
@@ -447,11 +453,24 @@ def _withdraw_collateral(
         ),
     )
 
+    from shared.settlement import create_settlement
+    from shared.request_context import get_actor_id, get_trace_id
+    settlement = create_settlement(
+        db,
+        related_entity_type="collateral",
+        related_entity_id=position.id,
+        operation="collateral_withdrawal",
+        asset_type=position.asset_type,
+        quantity=req.quantity,
+        actor_id=get_actor_id(),
+        trace_id=get_trace_id(),
+    )
+
     log.info(
         "Collateral withdrawn: %s qty=%s",
         req.collateral_ref, req.quantity,
     )
-    return position
+    return position, settlement
 
 
 def _substitute_collateral(
@@ -648,6 +667,16 @@ app = FastAPI(
 instrument_app(app, SERVICE)
 
 
+@app.middleware("http")
+async def extract_context(request, call_next):
+    from shared.request_context import set_context
+    trace_id = request.headers.get("X-Trace-ID", "")
+    actor_id = request.headers.get("X-Actor-Id", "")
+    set_context(trace_id=trace_id, actor_id=actor_id)
+    response = await call_next(request)
+    return response
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": SERVICE}
@@ -659,6 +688,7 @@ def health():
     status_code=status.HTTP_201_CREATED,
 )
 def deposit_collateral(
+    request: Request,
     req: DepositCollateralRequest,
     db: Session = Depends(get_db_session),
 ):
@@ -667,6 +697,14 @@ def deposit_collateral(
     Creates a new collateral position, records custody journal
     entries, and computes estimated USD value using latest prices.
     """
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     position = _deposit_collateral(db, req)
 
     latest_prices = _get_latest_prices(db)
@@ -674,7 +712,7 @@ def deposit_collateral(
     estimated = _compute_position_value(position, price)
 
     loan = db.get(Loan, position.loan_id)
-    return CollateralResponse(
+    result = CollateralResponse(
         collateral_ref=position.collateral_ref,
         loan_ref=loan.loan_ref if loan else "unknown",
         asset_type=position.asset_type,
@@ -683,10 +721,16 @@ def deposit_collateral(
         status=position.status,
         estimated_value_usd=estimated,
     )
+    if idem_key:
+        store_idempotency_result(
+            db, idem_key, 201, result.model_dump(mode="json"),
+        )
+    return result
 
 
 @app.post("/collateral/withdraw")
 def withdraw_collateral(
+    request: Request,
     req: WithdrawCollateralRequest,
     db: Session = Depends(get_db_session),
 ):
@@ -695,14 +739,26 @@ def withdraw_collateral(
     Verifies that post-withdrawal LTV remains below the initial
     LTV limit before releasing collateral.
     """
-    position = _withdraw_collateral(db, req)
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
+    position, settlement = _withdraw_collateral(db, req)
     loan = db.get(Loan, position.loan_id)
-    return {
+    result = {
         "collateral_ref": position.collateral_ref,
         "loan_ref": loan.loan_ref if loan else "unknown",
         "status": position.status,
         "remaining_quantity": str(position.quantity),
+        "settlement_ref": settlement.settlement_ref,
     }
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.post(
@@ -710,6 +766,7 @@ def withdraw_collateral(
     status_code=status.HTTP_201_CREATED,
 )
 def substitute_collateral(
+    request: Request,
     req: SubstituteCollateralRequest,
     db: Session = Depends(get_db_session),
 ):
@@ -718,6 +775,14 @@ def substitute_collateral(
     Verifies that post-substitution LTV remains below the initial
     LTV limit before executing.
     """
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     old_pos, new_pos = _substitute_collateral(db, req)
     loan = db.get(Loan, new_pos.loan_id)
 
@@ -725,7 +790,7 @@ def substitute_collateral(
     price = latest_prices.get(new_pos.asset_type, ZERO)
     estimated = _compute_position_value(new_pos, price)
 
-    return {
+    result = {
         "removed": {
             "collateral_ref": old_pos.collateral_ref,
             "status": old_pos.status,
@@ -740,6 +805,9 @@ def substitute_collateral(
             "estimated_value_usd": str(estimated),
         },
     }
+    if idem_key:
+        store_idempotency_result(db, idem_key, 201, result)
+    return result
 
 
 @app.get(

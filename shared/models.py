@@ -449,6 +449,8 @@ class LoanStatusHistory(Base):
     )
     status = Column(String(20), nullable=False)
     detail = Column(JSONB)
+    actor_id = Column(String(255))
+    trace_id = Column(String(255))
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(),
     )
@@ -468,6 +470,8 @@ class CollateralStatusHistory(Base):
     )
     status = Column(String(20), nullable=False)
     detail = Column(JSONB)
+    actor_id = Column(String(255))
+    trace_id = Column(String(255))
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(),
     )
@@ -487,6 +491,8 @@ class MarginCallStatusHistory(Base):
     )
     status = Column(String(20), nullable=False)
     detail = Column(JSONB)
+    actor_id = Column(String(255))
+    trace_id = Column(String(255))
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(),
     )
@@ -506,6 +512,8 @@ class LiquidationStatusHistory(Base):
     )
     status = Column(String(20), nullable=False)
     detail = Column(JSONB)
+    actor_id = Column(String(255))
+    trace_id = Column(String(255))
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(),
     )
@@ -526,5 +534,148 @@ class ComplianceEvent(Base):
     score = Column(Numeric(5, 2))
     details = Column(JSONB, nullable=False, default=dict)
     checked_at = Column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+
+# ─── RBAC ─────────────────────────────────────────────────────────────────────
+
+class ApiRole(str, enum.Enum):
+    ADMIN    = "admin"
+    OPERATOR = "operator"
+    SIGNER   = "signer"
+    VIEWER   = "viewer"
+    SYSTEM   = "system"
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+
+    id = Column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    key_hash = Column(
+        String(255), unique=True, nullable=False,
+    )
+    role = Column(String(20), nullable=False)
+    label = Column(String(255), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+
+# ─── Idempotency ──────────────────────────────────────────────────────────────
+
+class IdempotencyKey(Base):
+    __tablename__ = "idempotency_keys"
+
+    key = Column(String(255), primary_key=True)
+    response_status = Column(Integer, nullable=False)
+    response_body = Column(JSONB, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+    expires_at = Column(DateTime(timezone=True))
+
+
+class ProcessedEvent(Base):
+    __tablename__ = "processed_events"
+
+    event_id = Column(String(255), primary_key=True)
+    topic = Column(String(255), nullable=False)
+    processed_at = Column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+
+# ─── Dead Letter Queue ────────────────────────────────────────────────────────
+
+class DlqEvent(Base):
+    __tablename__ = "dlq_events"
+
+    id = Column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    original_topic = Column(String(255), nullable=False)
+    event_id = Column(String(255), nullable=False)
+    payload = Column(JSONB, nullable=False)
+    error_message = Column(Text, nullable=False)
+    retry_count = Column(Integer, nullable=False, default=0)
+    first_failed_at = Column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+    last_failed_at = Column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+
+# ─── Settlement ───────────────────────────────────────────────────────────────
+
+class SettlementStatus(str, enum.Enum):
+    PENDING     = "pending"
+    APPROVED    = "approved"
+    SIGNED      = "signed"
+    BROADCASTED = "broadcasted"
+    CONFIRMED   = "confirmed"
+    FAILED      = "failed"
+
+
+class Settlement(Base):
+    __tablename__ = "settlements"
+
+    id = Column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    settlement_ref = Column(
+        String(64), unique=True, nullable=False,
+    )
+    related_entity_type = Column(String(50), nullable=False)
+    related_entity_id = Column(
+        UUID(as_uuid=True), nullable=False,
+    )
+    operation = Column(String(50), nullable=False)
+    asset_type = Column(String(10), nullable=False)
+    quantity = Column(Numeric(28, 8), nullable=False)
+    tx_hash = Column(String(255))
+    block_number = Column(Integer)
+    confirmations = Column(
+        Integer, nullable=False, default=0,
+    )
+    required_confirmations = Column(
+        Integer, nullable=False, default=6,
+    )
+    status = Column(
+        String(20), nullable=False, default="pending",
+    )
+    approved_by = Column(String(255))
+    signed_at = Column(DateTime(timezone=True))
+    broadcasted_at = Column(DateTime(timezone=True))
+    confirmed_at = Column(DateTime(timezone=True))
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+
+class SettlementStatusHistory(Base):
+    __tablename__ = "settlement_status_history"
+
+    id = Column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    settlement_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("settlements.id"),
+        nullable=False,
+        index=True,
+    )
+    status = Column(String(20), nullable=False)
+    detail = Column(JSONB)
+    actor_id = Column(String(255))
+    trace_id = Column(String(255))
+    created_at = Column(
         DateTime(timezone=True), server_default=func.now(),
     )

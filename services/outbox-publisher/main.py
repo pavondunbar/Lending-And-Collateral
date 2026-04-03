@@ -33,6 +33,9 @@ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
 POLL_INTERVAL_MS = int(os.environ.get("POLL_INTERVAL_MS", "100"))
 BATCH_SIZE = 100
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8010"))
+MAX_PUBLISH_FAILURES = 3
+
+_publish_failures: dict[str, int] = {}
 
 FETCH_QUERY = """
     SELECT id, event_type, aggregate_id, payload, created_at
@@ -64,7 +67,9 @@ async def publish_batch(
             if not rows:
                 return 0
 
+            published_ids = []
             for row in rows:
+                event_id = str(row["id"])
                 topic = row["event_type"]
                 key = row["aggregate_id"]
                 payload = row["payload"]
@@ -73,18 +78,62 @@ async def publish_batch(
                     if isinstance(payload, str)
                     else json.dumps(payload).encode("utf-8")
                 )
-                await producer.send_and_wait(
-                    topic=topic,
-                    key=key.encode("utf-8") if key else None,
-                    value=value,
+                try:
+                    await producer.send_and_wait(
+                        topic=topic,
+                        key=(
+                            key.encode("utf-8") if key
+                            else None
+                        ),
+                        value=value,
+                    )
+                    _publish_failures.pop(event_id, None)
+                    published_ids.append(row["id"])
+                except Exception as exc:
+                    count = _publish_failures.get(event_id, 0) + 1
+                    _publish_failures[event_id] = count
+                    if count > MAX_PUBLISH_FAILURES:
+                        log.error(
+                            "Event %s exceeded %d publish "
+                            "retries, sending to DLQ",
+                            event_id, MAX_PUBLISH_FAILURES,
+                        )
+                        await conn.execute(
+                            """
+                            INSERT INTO dlq_events
+                                (original_topic, event_id,
+                                 payload, error_message,
+                                 retry_count)
+                            VALUES ($1, $2, $3, $4, $5)
+                            """,
+                            topic,
+                            event_id,
+                            (
+                                payload
+                                if isinstance(payload, str)
+                                else json.dumps(payload)
+                            ),
+                            str(exc),
+                            count,
+                        )
+                        published_ids.append(row["id"])
+                        _publish_failures.pop(event_id, None)
+                    else:
+                        log.warning(
+                            "Failed to publish event %s "
+                            "(attempt %d/%d): %s",
+                            event_id, count,
+                            MAX_PUBLISH_FAILURES, exc,
+                        )
+
+            if published_ids:
+                now = datetime.now(timezone.utc)
+                await conn.execute(
+                    MARK_PUBLISHED_QUERY, now, published_ids,
                 )
 
-            event_ids = [row["id"] for row in rows]
-            now = datetime.now(timezone.utc)
-            await conn.execute(MARK_PUBLISHED_QUERY, now, event_ids)
-
-            log.info("Published %d events", len(rows))
-            return len(rows)
+            log.info("Published %d events", len(published_ids))
+            return len(published_ids)
 
 
 async def poll_loop(

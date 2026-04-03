@@ -59,6 +59,41 @@ create_topic "audit.trail"                8   2592000000  # 30 days
 create_topic "signing.request"            2
 create_topic "signing.completed"          2
 
+# -- Dead Letter Queues (DLQ) ----------------------------------------------------------
+create_topic "loan.originated.dlq"            2 2592000000
+create_topic "loan.disbursed.dlq"             2 2592000000
+create_topic "loan.repayment.received.dlq"    2 2592000000
+create_topic "loan.repayment.completed.dlq"   2 2592000000
+create_topic "loan.closed.dlq"                2 2592000000
+create_topic "loan.interest.accrued.dlq"      2 2592000000
+create_topic "collateral.deposited.dlq"       2 2592000000
+create_topic "collateral.withdrawn.dlq"       2 2592000000
+create_topic "collateral.substituted.dlq"     2 2592000000
+create_topic "collateral.valued.dlq"          2 2592000000
+create_topic "margin.call.triggered.dlq"      2 2592000000
+create_topic "margin.call.met.dlq"            2 2592000000
+create_topic "margin.call.expired.dlq"        2 2592000000
+create_topic "liquidation.initiated.dlq"      2 2592000000
+create_topic "liquidation.executed.dlq"       2 2592000000
+create_topic "liquidation.completed.dlq"      2 2592000000
+create_topic "price.feed.updated.dlq"         2 2592000000
+create_topic "compliance.event.dlq"           2 2592000000
+create_topic "audit.trail.dlq"                2 2592000000
+create_topic "signing.request.dlq"            2 2592000000
+create_topic "signing.completed.dlq"          2 2592000000
+
+# -- Settlement -------------------------------------------------------------------------
+create_topic "settlement.created"             4 2592000000
+create_topic "settlement.approved"            4 2592000000
+create_topic "settlement.signed"              4 2592000000
+create_topic "settlement.broadcasted"         4 2592000000
+create_topic "settlement.confirmed"           4 2592000000
+create_topic "settlement.created.dlq"         2 2592000000
+create_topic "settlement.approved.dlq"        2 2592000000
+create_topic "settlement.signed.dlq"          2 2592000000
+create_topic "settlement.broadcasted.dlq"     2 2592000000
+create_topic "settlement.confirmed.dlq"       2 2592000000
+
 echo ""
 echo "All Kafka topics created successfully."
 kafka-topics --bootstrap-server "$KAFKA" --list

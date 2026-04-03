@@ -30,6 +30,8 @@ class BaseEvent(BaseModel):
     event_id:   str      = Field(default_factory=_uuid)
     event_time: datetime = Field(default_factory=_now)
     service:    str      = "unknown"
+    actor_id:   str      = ""
+    trace_id:   str      = ""
 
     class Config:
         json_encoders = {
@@ -223,3 +225,37 @@ class AuditTrailEntry(BaseEvent):
     before_state:  Optional[dict] = None
     after_state:   Optional[dict] = None
     ip_address:    Optional[str]  = None
+
+
+# ── Settlement Events ──────────────────────────────────────────────
+
+class SettlementCreated(BaseEvent):
+    settlement_ref:       str
+    related_entity_type:  str
+    related_entity_id:    str
+    operation:            str
+    asset_type:           str
+    quantity:             Decimal
+
+
+class SettlementApproved(BaseEvent):
+    settlement_ref: str
+    approved_by:    str
+
+
+class SettlementSigned(BaseEvent):
+    settlement_ref: str
+    tx_hash:        str
+
+
+class SettlementBroadcasted(BaseEvent):
+    settlement_ref: str
+    tx_hash:        str
+    block_number:   Optional[int] = None
+
+
+class SettlementConfirmed(BaseEvent):
+    settlement_ref:  str
+    tx_hash:         str
+    block_number:    int
+    confirmations:   int

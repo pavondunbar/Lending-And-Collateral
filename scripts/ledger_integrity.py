@@ -364,6 +364,46 @@ def check_interest_accrual_continuity(cur):
     )
 
 
+def check_settlement_status_consistency(cur):
+    """Check 9: Every settlement's status matches latest history row."""
+    cur.execute("""
+        SELECT s.id, s.settlement_ref,
+               s.status AS settlement_status,
+               scs.status AS history_status
+        FROM settlements s
+        LEFT JOIN LATERAL (
+            SELECT ssh.status
+            FROM settlement_status_history ssh
+            WHERE ssh.settlement_id = s.id
+            ORDER BY ssh.created_at DESC
+            LIMIT 1
+        ) scs ON TRUE
+        WHERE scs.status IS NOT NULL
+          AND s.status::text != scs.status
+    """)
+    mismatches = cur.fetchall()
+    if mismatches:
+        details = [
+            f"settlement={r[1]} current={r[2]} history={r[3]}"
+            for r in mismatches[:5]
+        ]
+        msg = (
+            f"{len(mismatches)} settlement status mismatch(es): "
+            + "; ".join(details)
+        )
+        if len(mismatches) > 5:
+            msg += f" ... and {len(mismatches) - 5} more"
+        return False, msg
+
+    cur.execute("SELECT COUNT(*) FROM settlements")
+    count = cur.fetchone()[0]
+    return (
+        True,
+        f"All {count} settlement(s) consistent "
+        f"with status history.",
+    )
+
+
 ALL_CHECKS = [
     (
         "Journal pair balance (debit == credit per journal_id)",
@@ -396,6 +436,10 @@ ALL_CHECKS = [
     (
         "Interest accrual continuity for active loans",
         check_interest_accrual_continuity,
+    ),
+    (
+        "Settlement status history consistency",
+        check_settlement_status_consistency,
     ),
 ]
 

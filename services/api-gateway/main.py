@@ -46,6 +46,8 @@ sys.path.insert(0, "/app/shared")
 import kafka_client as kafka
 from metrics import instrument_app
 from events import AuditTrailEntry
+from rbac import hash_key, check_permission
+from models import ApiKey
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -105,6 +107,9 @@ class SimpleRateLimiter:
 
 limiter = SimpleRateLimiter()
 
+# RBAC: in-memory key cache {key_hash: (key_id, role)}
+_api_key_cache: dict[str, tuple[str, str]] = {}
+
 # --- HTTP Client ----------------------------------------------------------
 
 _http_client: Optional[httpx.AsyncClient] = None
@@ -122,12 +127,34 @@ async def require_api_key(request: Request):
         request.headers.get("X-API-Key")
         or request.query_params.get("api_key")
     )
-    if not key or key != GATEWAY_API_KEY:
+    if not key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key",
             headers={"WWW-Authenticate": "ApiKey"},
         )
+
+    if key == GATEWAY_API_KEY:
+        request.state.actor_id = "admin:legacy"
+        request.state.actor_role = "admin"
+    else:
+        key_hex = hash_key(key)
+        entry = _api_key_cache.get(key_hex)
+        if not entry:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing API key",
+                headers={"WWW-Authenticate": "ApiKey"},
+            )
+        key_id, role = entry
+        if not check_permission(role, request.method, str(request.url.path)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Role '{role}' cannot {request.method} {request.url.path}",
+            )
+        request.state.actor_id = f"{role}:{key_id}"
+        request.state.actor_role = role
+
     if not limiter.is_allowed(key):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -155,6 +182,13 @@ async def _proxy(
         if k.lower() not in ("host", "x-api-key", "content-length")
     }
     headers["X-Request-ID"] = request.state.request_id
+    headers["X-Trace-ID"] = request.state.request_id
+    actor_id = getattr(request.state, "actor_id", "")
+    if actor_id:
+        headers["X-Actor-Id"] = actor_id
+    actor_role = getattr(request.state, "actor_role", "")
+    if actor_role:
+        headers["X-Actor-Role"] = actor_role
 
     try:
         upstream_resp = await client.request(
@@ -206,6 +240,7 @@ async def audit_middleware(request: Request, call_next):
                 "action": f"{request.method} {request.url.path}",
                 "entity_type": "http_request",
                 "entity_id": request_id,
+                "trace_id": request_id,
                 "after_state": {
                     "status_code": response.status_code,
                     "elapsed_ms": elapsed_ms,
@@ -215,6 +250,7 @@ async def audit_middleware(request: Request, call_next):
                 "ip_address": (
                     request.client.host if request.client else None
                 ),
+                "actor_id": getattr(request.state, "actor_id", ""),
                 "event_time": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -247,6 +283,16 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(30.0),
     )
     log.info("API Gateway started. Upstreams: %s", UPSTREAM)
+    # Load API keys from DB or use default
+    default_key_hash = hash_key("change-me-in-production")
+    _api_key_cache[default_key_hash] = (
+        "00000000-0000-0000-0000-000000000010", "admin",
+    )
+    viewer_key_hash = hash_key("viewer-demo-key")
+    _api_key_cache[viewer_key_hash] = (
+        "viewer-demo", "viewer",
+    )
+    log.info("RBAC: loaded %d API keys", len(_api_key_cache))
     yield
     await _http_client.aclose()
     log.info("API Gateway shut down.")

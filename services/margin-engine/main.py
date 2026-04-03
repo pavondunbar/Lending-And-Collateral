@@ -27,9 +27,11 @@ from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
+from starlette.requests import Request
 
 # ── path setup so we can import the shared package ──────────────────
 import sys
@@ -46,6 +48,10 @@ from shared.status import record_status
 from shared.models import (
     LoanStatusHistory, MarginCallStatusHistory,
     LiquidationStatusHistory,
+)
+from shared.idempotency import (
+    get_idempotency_key, check_idempotency,
+    store_idempotency_result,
 )
 from events import (
     MarginCallTriggered, MarginCallMet, MarginCallExpired,
@@ -531,6 +537,16 @@ app = FastAPI(
 instrument_app(app, SERVICE)
 
 
+@app.middleware("http")
+async def extract_context(request, call_next):
+    from shared.request_context import set_context
+    trace_id = request.headers.get("X-Trace-ID", "")
+    actor_id = request.headers.get("X-Actor-Id", "")
+    set_context(trace_id=trace_id, actor_id=actor_id)
+    response = await call_next(request)
+    return response
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": SERVICE}
@@ -538,10 +554,19 @@ def health():
 
 @app.post("/margin/evaluate")
 def evaluate_loan(
+    request: Request,
     req: EvaluateLoanRequest,
     db: Session = Depends(get_db_session),
 ):
     """Evaluate LTV for a single loan and trigger actions."""
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     loan = db.execute(
         select(Loan).where(Loan.loan_ref == req.loan_ref)
     ).scalar_one_or_none()
@@ -554,14 +579,26 @@ def evaluate_loan(
             status_code=422,
             detail=f"Cannot evaluate {loan.status} loan",
         )
-    return _evaluate_loan_ltv(db, loan)
+    result = _evaluate_loan_ltv(db, loan)
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.post("/margin/evaluate-all")
 def evaluate_all_loans(
+    request: Request,
     db: Session = Depends(get_db_session),
 ):
     """Batch LTV evaluation of all active loans."""
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     active_loans = db.execute(
         select(Loan).where(
             Loan.status.in_(["active", "margin_call"])
@@ -577,10 +614,13 @@ def evaluate_all_loans(
         "Batch LTV evaluation completed: %d loans",
         len(results),
     )
-    return {
+    result = {
         "evaluated": len(results),
         "loans": results,
     }
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.get("/margin/status/{loan_ref}")
@@ -692,6 +732,7 @@ def list_margin_calls(
 
 @app.post("/margin/calls/{ref}/respond")
 def respond_to_margin_call(
+    request: Request,
     ref: str,
     req: MarginCallRespondRequest,
     db: Session = Depends(get_db_session),
@@ -702,6 +743,14 @@ def respond_to_margin_call(
     the loan LTV. If LTV falls below maintenance, the margin
     call is marked as met.
     """
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     margin_call = db.execute(
         select(MarginCall).where(
             MarginCall.margin_call_ref == ref,
@@ -726,24 +775,39 @@ def respond_to_margin_call(
             status_code=404, detail="Associated loan not found",
         )
 
-    result = _evaluate_loan_ltv(db, loan)
+    evaluation = _evaluate_loan_ltv(db, loan)
 
-    return {
+    result = {
         "margin_call_ref": ref,
-        "evaluation": result,
+        "evaluation": evaluation,
     }
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 @app.post("/margin/calls/check-expired")
 def check_expired_margin_calls(
+    request: Request,
     db: Session = Depends(get_db_session),
 ):
     """Check for expired margin calls and initiate liquidation."""
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     results = _check_expired_margin_calls(db)
-    return {
+    result = {
         "expired_count": len(results),
         "expired": results,
     }
+    if idem_key:
+        store_idempotency_result(db, idem_key, 200, result)
+    return result
 
 
 if __name__ == "__main__":

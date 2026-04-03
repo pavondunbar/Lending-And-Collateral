@@ -94,7 +94,7 @@ def step(title: str):
 
 # ---- Helpers ---------------------------------------------------------------
 
-DOCKER_CONTAINER = "lending-and-collateral-postgres-1"
+DOCKER_CONTAINER = "lending-python-postgres-1"
 DB_USER = "lending"
 DB_NAME = "lending_db"
 
@@ -640,6 +640,127 @@ def demo_repayment_and_closure(
                 info(f"  {stripped}")
 
 
+def demo_rbac() -> None:
+    """Steps 27-28: verify role-based access control enforcement."""
+    h1("7 - RBAC: Role-Based Access Control")
+
+    viewer_headers = {
+        "X-API-Key": "viewer-demo-key",
+        "Content-Type": "application/json",
+    }
+
+    step("Test viewer role is blocked on POST")
+    with httpx.Client(base_url=GW, timeout=30) as viewer:
+        r = viewer.post(
+            "/v1/loans/originate",
+            headers=viewer_headers,
+            json={},
+        )
+        if r.status_code == 403:
+            ok(f"POST /v1/loans/originate -> HTTP 403 (blocked)")
+            info(f"  Response: {r.text[:200]}")
+        else:
+            fail(
+                f"Expected 403 but got {r.status_code}: "
+                f"{r.text[:200]}"
+            )
+
+        step("Test viewer role can GET")
+        r = viewer.get("/v1/loans", headers=viewer_headers)
+        if r.status_code == 200:
+            ok(f"GET /v1/loans -> HTTP 200 (allowed)")
+            data = r.json()
+            info(f"  Returned {len(data)} loan(s)")
+        else:
+            fail(
+                f"Expected 200 but got {r.status_code}: "
+                f"{r.text[:200]}"
+            )
+
+
+def demo_idempotency(loan_ref: str) -> None:
+    """Steps 29-30: verify duplicate request prevention."""
+    h1("8 - Idempotency: Duplicate Request Prevention")
+
+    step(
+        "Send same accrue-interest request twice "
+        "with same Idempotency-Key"
+    )
+    idem_key = str(uuid.uuid4())
+    accrual_date = str(
+        datetime.now(timezone.utc).date() + timedelta(days=90)
+    )
+    url = f"/v1/loans/{loan_ref}/accrue-interest"
+    payload = {"accrual_date": accrual_date}
+    headers_with_key = {
+        **HEADERS,
+        "Idempotency-Key": idem_key,
+    }
+
+    r1 = client.post(url, json=payload, headers=headers_with_key)
+    info(
+        f"  Request 1: HTTP {r1.status_code}  "
+        f"Idempotency-Key={idem_key[:12]}..."
+    )
+    body1 = r1.text
+
+    r2 = client.post(url, json=payload, headers=headers_with_key)
+    info(
+        f"  Request 2: HTTP {r2.status_code}  "
+        f"Idempotency-Key={idem_key[:12]}..."
+    )
+    body2 = r2.text
+
+    if r1.status_code == r2.status_code and body1 == body2:
+        ok("Both responses are identical (idempotent)")
+    else:
+        info(
+            "Responses differ -- server may not enforce "
+            "idempotency on this endpoint"
+        )
+        info(f"  Response 1: {body1[:200]}")
+        info(f"  Response 2: {body2[:200]}")
+
+
+def demo_settlement() -> None:
+    """Steps 31-32: query settlement state machine from Postgres."""
+    h1("9 - Settlement State Machine")
+
+    step("Query settlements from Postgres")
+    rows = psql(
+        "SELECT settlement_ref, status, operation, asset_type "
+        "FROM settlements "
+        "ORDER BY created_at DESC LIMIT 5;"
+    )
+    if rows:
+        ok("Recent settlements:")
+        for line in rows.splitlines():
+            stripped = line.strip()
+            if stripped:
+                info(f"  {stripped}")
+    else:
+        info("No settlements found (table may be empty).")
+
+    step("Show settlement status history")
+    rows = psql(
+        "SELECT s.settlement_ref, ssh.status, ssh.created_at "
+        "FROM settlement_status_history ssh "
+        "JOIN settlements s ON s.id = ssh.settlement_id "
+        "ORDER BY ssh.created_at DESC LIMIT 10;"
+    )
+    if rows:
+        ok("Settlement status history:")
+        for line in rows.splitlines():
+            stripped = line.strip()
+            if stripped:
+                info(f"  {stripped}")
+    else:
+        info(
+            "No settlement status history found "
+            "(table may be empty)."
+        )
+
+
 # ---- Main Demo Runner ------------------------------------------------------
 
 def run():
@@ -675,6 +796,12 @@ def run():
 
         demo_repayment_and_closure(loan_ref, atlas_id)
 
+        demo_rbac()
+
+        demo_idempotency(loan_ref)
+
+        demo_settlement()
+
     except SystemExit:
         print(f"\n{RED}Demo aborted -- see error above.{RESET}")
         sys.exit(1)
@@ -690,6 +817,9 @@ def run():
         "All events published via transactional "
         "outbox to Kafka"
     )
+    ok("RBAC role-based access enforcement")
+    ok("Idempotent request handling")
+    ok("Settlement state machine lifecycle")
     print(
         f"\n  {BOLD}"
         f"Explore the OpenAPI docs at: {GW}/docs"

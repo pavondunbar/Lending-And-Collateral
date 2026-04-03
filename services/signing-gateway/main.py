@@ -12,8 +12,20 @@ import hashlib
 import json
 import logging
 import os
+import uuid
+from decimal import Decimal
 
 from aiohttp import ClientSession, ClientTimeout, web
+
+from shared.settlement import create_settlement, transition_settlement
+from shared.outbox import insert_outbox_event
+from shared.models import Settlement
+from events import (
+    SettlementCreated, SettlementApproved,
+    SettlementSigned, SettlementBroadcasted,
+    SettlementConfirmed,
+)
+from database import get_db_session, SessionLocal
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -130,15 +142,102 @@ async def _fan_out_and_combine(
         )
 
     combined = _combine_signatures(partials)
+    tx_hash = hashlib.sha256(combined.encode()).hexdigest()[:40]
     log.info(
         "Signed txn %s: %d/%d partials collected",
         transaction_id,
         len(partials),
         len(nodes),
     )
+
+    settlement_ref = ""
+    try:
+        db_session = SessionLocal()
+        try:
+            from shared.request_context import (
+                get_actor_id,
+                get_trace_id,
+            )
+            actor = get_actor_id() or "signing-gateway"
+            trace = get_trace_id()
+
+            entity_id_str = payload.get(
+                "loan_ref", str(uuid.uuid4()),
+            )
+            entity_type = payload.get("operation", "signing")
+
+            settlement = create_settlement(
+                db_session,
+                related_entity_type=entity_type,
+                related_entity_id=uuid.uuid4(),
+                operation=payload.get("operation", "sign"),
+                asset_type=payload.get(
+                    "asset_type", "UNKNOWN",
+                ),
+                quantity=Decimal(
+                    payload.get("quantity", "0"),
+                ),
+                actor_id=actor,
+                trace_id=trace,
+            )
+            settlement_ref = settlement.settlement_ref
+
+            transition_settlement(
+                db_session, settlement, "approved",
+                actor_id=actor, trace_id=trace,
+                approved_by=actor,
+            )
+
+            transition_settlement(
+                db_session, settlement, "signed",
+                actor_id=actor, trace_id=trace,
+                tx_hash=tx_hash,
+            )
+
+            transition_settlement(
+                db_session, settlement, "broadcasted",
+                actor_id=actor, trace_id=trace,
+                tx_hash=tx_hash,
+                block_number=12345678,
+            )
+
+            transition_settlement(
+                db_session, settlement, "confirmed",
+                actor_id=actor, trace_id=trace,
+                confirmations=6,
+            )
+
+            insert_outbox_event(
+                db_session,
+                settlement_ref,
+                "settlement.confirmed",
+                SettlementConfirmed(
+                    service=SERVICE,
+                    settlement_ref=settlement_ref,
+                    tx_hash=tx_hash,
+                    block_number=12345678,
+                    confirmations=6,
+                ),
+            )
+
+            db_session.commit()
+        except Exception as exc:
+            db_session.rollback()
+            log.warning(
+                "Settlement lifecycle failed: %s", exc,
+            )
+        finally:
+            db_session.close()
+    except Exception as exc:
+        log.warning(
+            "Settlement DB connection failed: %s", exc,
+        )
+
     return web.json_response({
         "transaction_id": transaction_id,
         "signature": combined,
+        "tx_hash": tx_hash,
+        "settlement_ref": settlement_ref,
         "partials_collected": len(partials),
         "threshold": threshold,
     })

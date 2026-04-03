@@ -19,6 +19,8 @@ def record_status(
     entity_id,
     status: str,
     detail: dict = None,
+    actor_id: str = None,
+    trace_id: str = None,
     **extra_fields,
 ) -> object:
     """Insert a status history row for the given entity.
@@ -32,21 +34,32 @@ def record_status(
         entity_id: The parent entity's primary key.
         status: New status string value.
         detail: Optional JSONB detail dict.
+        actor_id: Actor identifier (defaults to contextvar).
+        trace_id: Trace identifier (defaults to contextvar).
         **extra_fields: Additional columns.
 
     Returns:
         The created status history row.
     """
+    from shared.request_context import get_actor_id, get_trace_id
+
     entity_uuid = (
         uuid.UUID(str(entity_id))
         if not isinstance(entity_id, uuid.UUID)
         else entity_id
     )
+    resolved_actor = actor_id or get_actor_id()
+    resolved_trace = trace_id or get_trace_id()
+
     kwargs = {
         entity_id_field: entity_uuid,
         "status": status,
         "detail": detail,
     }
+    if resolved_actor:
+        kwargs["actor_id"] = resolved_actor
+    if resolved_trace:
+        kwargs["trace_id"] = resolved_trace
     kwargs.update(extra_fields)
     row = model_class(**kwargs)
     db.add(row)

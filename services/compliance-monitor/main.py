@@ -394,7 +394,12 @@ def _start_consumer():
         group_id="compliance-monitor-group",
         topics=MONITORED_TOPICS,
     )
-    kafka.consume_loop(consumer, handle_event)
+    kafka.consume_loop(
+        consumer,
+        handle_event,
+        max_retries=3,
+        db_session_factory=SessionLocal,
+    )
 
 
 # --- FastAPI Health / Metrics Endpoint ------------------------------------

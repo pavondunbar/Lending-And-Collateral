@@ -25,9 +25,11 @@ from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, desc
 from sqlalchemy.orm import Session
+from starlette.requests import Request
 
 # ── path setup so we can import the shared package ──────────────────
 import sys
@@ -37,6 +39,10 @@ from database import get_db_session, SessionLocal
 from metrics import instrument_app
 from models import PriceFeed
 from shared.outbox import insert_outbox_event
+from shared.idempotency import (
+    get_idempotency_key, check_idempotency,
+    store_idempotency_result,
+)
 from events import PriceFeedReceived, PriceAggregated
 
 # ────────────────────────────────────────────────────────────────────
@@ -329,6 +335,16 @@ app = FastAPI(
 instrument_app(app, SERVICE)
 
 
+@app.middleware("http")
+async def extract_context(request, call_next):
+    from shared.request_context import set_context
+    trace_id = request.headers.get("X-Trace-ID", "")
+    actor_id = request.headers.get("X-Actor-Id", "")
+    set_context(trace_id=trace_id, actor_id=actor_id)
+    response = await call_next(request)
+    return response
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": SERVICE}
@@ -340,22 +356,37 @@ def health():
     status_code=status.HTTP_201_CREATED,
 )
 def ingest_price(
+    request: Request,
     req: IngestPriceRequest,
     db: Session = Depends(get_db_session),
 ):
     """Ingest a price feed from an external source."""
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     feed = _ingest_price(db, req)
-    return PriceResponse(
+    result = PriceResponse(
         asset_type=feed.asset_type,
         price_usd=feed.price_usd,
         source=feed.source,
         volume_24h=feed.volume_24h,
         recorded_at=feed.recorded_at,
     )
+    if idem_key:
+        store_idempotency_result(
+            db, idem_key, 201, result.model_dump(mode="json"),
+        )
+    return result
 
 
 @app.post("/prices/aggregate", response_model=PriceResponse)
 def aggregate_price(
+    request: Request,
     req: AggregatePriceRequest,
     db: Session = Depends(get_db_session),
 ):
@@ -364,16 +395,29 @@ def aggregate_price(
     Uses volume-weighted average when volume data is available,
     falls back to simple average otherwise.
     """
+    idem_key = get_idempotency_key(request)
+    if idem_key:
+        existing = check_idempotency(db, idem_key)
+        if existing:
+            return JSONResponse(
+                status_code=existing.response_status,
+                content=existing.response_body,
+            )
     feed = _aggregate_vwap(
         db, req.asset_type,
         req.lookback_minutes, req.max_entries,
     )
-    return PriceResponse(
+    result = PriceResponse(
         asset_type=feed.asset_type,
         price_usd=feed.price_usd,
         source=feed.source,
         recorded_at=feed.recorded_at,
     )
+    if idem_key:
+        store_idempotency_result(
+            db, idem_key, 200, result.model_dump(mode="json"),
+        )
+    return result
 
 
 @app.get("/prices/{asset_type}", response_model=PriceResponse)
